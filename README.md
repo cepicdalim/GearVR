@@ -6,6 +6,7 @@ Local Mac-to-Gear-VR game streaming prototype for a Samsung Note 5 on Android 7.
 
 - Android receiver targets API 24, discovers the Mac sender over DNS-SD, connects over TCP, decodes H.264 with MediaCodec, and displays video on the phone. Head tracking and controller diagnostics remain visible over the video.
 - The Mac app advertises `_gearvrsender._tcp` over Bonjour, captures the selected display with ScreenCaptureKit, and sends low-delay 1080p H.264 hardware-encoded frames from VideoToolbox over TCP.
+- The Android receiver includes optimized 4K x 2K equirectangular backgrounds under `app/src/main/assets/backgrounds`; controller left/right changes the scene background while the video remains in front.
 
 The stream uses length-prefixed TCP packets with H.264 SPS/PPS configuration and encoded access units. Test with both devices on the same non-isolated LAN and allow local network access in macOS privacy settings and the firewall. Samsung's VR service recognizes the package, but headset rendering and controller input still require testing with the phone physically mounted in Gear VR; input is not yet sent back to macOS.
 

@@ -7,11 +7,15 @@ import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.wifi.WifiManager;
 import android.net.wifi.WifiInfo;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
 import android.view.Surface;
@@ -21,13 +25,18 @@ import android.view.View;
 import android.view.WindowManager;
 
 import org.gearvrf.GVRActivity;
+import org.gearvrf.GVRAndroidResource;
 import org.gearvrf.GVRContext;
 import org.gearvrf.GVRMain;
+import org.gearvrf.GVRMaterial;
 import org.gearvrf.GVRScene;
+import org.gearvrf.GVRTextureParameters;
+import org.gearvrf.GVRSceneObject;
 import org.gearvrf.GVRCursorController;
 import org.gearvrf.io.CursorControllerListener;
 import org.gearvrf.io.GVRControllerType;
 import org.gearvrf.scene_objects.GVRTextViewSceneObject;
+import org.gearvrf.scene_objects.GVRSphereSceneObject;
 import org.gearvrf.scene_objects.GVRVideoSceneObject;
 import org.gearvrf.scene_objects.GVRVideoSceneObjectPlayer;
 
@@ -45,6 +54,26 @@ import java.util.Locale;
 public final class MainActivity extends GVRActivity implements SensorEventListener {
     private static final int MAX_PACKET_SIZE = 16 * 1024 * 1024;
     private static final byte[] START_CODE = {0, 0, 0, 1};
+    private static final String[] BACKGROUND_PATHS = {
+        "backgrounds/rooms/cinema_hall.jpg",
+        "backgrounds/rooms/games_room.jpg",
+        "backgrounds/rooms/cinema_lobby.jpg",
+        "backgrounds/rooms/comfy_cafe.jpg",
+        "backgrounds/rooms/old_outdoor_theater.jpg",
+        "backgrounds/nature/misty_pines.jpg",
+        "backgrounds/nature/snowy_forest.jpg",
+        "backgrounds/nature/autumn_field.jpg",
+        "backgrounds/nature/kiara_1_dawn.jpg",
+        "backgrounds/nature/the_sky_is_on_fire.jpg",
+        "backgrounds/nature/venice_sunset.jpg",
+        "backgrounds/nature/ettling_isar.jpg",
+        "backgrounds/nature/ampleben_night_sky.jpg"
+    };
+    private static final String[] BACKGROUND_NAMES = {
+        "Cinema hall", "Game room", "Cinema lobby", "Cafe", "Outdoor theater",
+        "Misty pines", "Snowy forest", "Autumn field", "Mountain dawn",
+        "Sunset coast", "Venice sunset", "Isar river", "Starry night"
+    };
     private final float[] rotation = new float[3];
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private SensorManager sensorManager;
@@ -57,6 +86,7 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
     private volatile Surface decoderSurface;
     private volatile Socket streamSocket;
     private volatile boolean receiverRunning;
+    private volatile String activeSenderEndpoint;
     private Thread receiverThread;
     private MediaCodec decoder;
     private volatile boolean decoderConfigured;
@@ -70,6 +100,7 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
     private volatile String sceneStatusText = "";
     private volatile GVRTextViewSceneObject vrStatus;
     private volatile StreamVrMain vrMain;
+    private long lastControllerActionMs;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -117,6 +148,33 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
         super.onPause();
     }
 
+    @Override
+    public boolean dispatchKeyEvent(android.view.KeyEvent event) {
+        if (event.getAction() == android.view.KeyEvent.ACTION_DOWN && vrMain != null
+                && handleControllerKey(event.getKeyCode())) {
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    private boolean handleControllerKey(int keyCode) {
+        if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_RIGHT
+                || keyCode == android.view.KeyEvent.KEYCODE_BUTTON_R1) {
+            vrMain.changeBackground(1);
+        } else if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_LEFT
+                || keyCode == android.view.KeyEvent.KEYCODE_BUTTON_L1) {
+            vrMain.changeBackground(-1);
+        } else if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_CENTER
+                || keyCode == android.view.KeyEvent.KEYCODE_BUTTON_A) {
+            vrMain.toggleTvFrame();
+        } else {
+            return false;
+        }
+        lastInput = android.view.KeyEvent.keyCodeToString(keyCode) + " pressed";
+        renderStatus("Controller input detected");
+        return true;
+    }
+
     private void startDiscovery() {
         if (discoveryListener != null) {
             return;
@@ -153,6 +211,8 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
 
                     @Override
                     public void onServiceResolved(NsdServiceInfo resolved) {
+                        Log.i("GearVRStream", "Sender resolved host="
+                                + resolved.getHost().getHostAddress() + " port=" + resolved.getPort());
                         connectToSender(resolved);
                         runOnUiThread(() -> {
                             discoveredSender = "Found " + resolved.getServiceName() + " at "
@@ -271,8 +331,14 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
         fallbackThread.start();
     }
 
-    private void connectToSender(NsdServiceInfo service) {
+    private synchronized void connectToSender(NsdServiceInfo service) {
+        String endpoint = service.getHost().getHostAddress() + ":" + service.getPort();
+        if (receiverRunning && endpoint.equals(activeSenderEndpoint)) {
+            Log.i("GearVRStream", "Ignoring duplicate sender resolution for " + endpoint);
+            return;
+        }
         stopReceiver();
+        activeSenderEndpoint = endpoint;
         receiverRunning = true;
         receiverThread = new Thread(() -> receiveStream(service), "gearvr-video-receiver");
         receiverThread.start();
@@ -280,6 +346,7 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
 
     private void stopReceiver() {
         receiverRunning = false;
+        activeSenderEndpoint = null;
         fallbackFound = true;
         if (fallbackThread != null) {
             fallbackThread.interrupt();
@@ -304,8 +371,11 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
         Socket socket = new Socket();
         try {
             streamSocket = socket;
+            bindSocketToWifi(socket);
             socket.setTcpNoDelay(true);
+            Log.i("GearVRStream", "Connecting to sender " + host + ":" + service.getPort());
             socket.connect(new InetSocketAddress(service.getHost(), service.getPort()), 5000);
+            Log.i("GearVRStream", "TCP connected to sender " + host + ":" + service.getPort());
             DataInputStream input = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
             runOnUiThread(() -> {
                 discoveredSender = "Connected to " + host + ":" + service.getPort() + ", waiting for video";
@@ -326,12 +396,33 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
                 }
             }
         } catch (EOFException error) {
-            showReceiverError("Sender disconnected");
+            if (receiverRunning) {
+                Log.w("GearVRStream", "Sender closed the video connection", error);
+                showReceiverError("Sender disconnected");
+            }
         } catch (Exception error) {
-            if (receiverRunning) showReceiverError("Video connection failed: " + error.getMessage());
+            if (receiverRunning) {
+                Log.e("GearVRStream", "Video connection failed to " + host + ":" + service.getPort(), error);
+                showReceiverError("Video connection failed: " + error.getMessage());
+            }
         } finally {
             try { socket.close(); } catch (IOException ignored) { }
             if (streamSocket == socket) streamSocket = null;
+        }
+    }
+
+    private void bindSocketToWifi(Socket socket) throws IOException {
+        ConnectivityManager connectivityManager =
+                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        for (Network network : connectivityManager.getAllNetworks()) {
+            NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
+            if (capabilities != null
+                    && capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                    && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) {
+                network.bindSocket(socket);
+                return;
+            }
         }
     }
 
@@ -475,6 +566,15 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
     private final class StreamVrMain extends GVRMain {
         private GVRTextViewSceneObject statusObject;
         private String renderedStatus;
+        private GVRScene scene;
+        private GVRSphereSceneObject backgroundObject;
+        private GVRSceneObject screenFrame;
+        private int backgroundIndex;
+        private long lastBackgroundChangeMs;
+        private boolean tvFrameEnabled = true;
+        private float touchpadStartX;
+        private boolean trackingTouchpadSwipe;
+        private float touchpadLastX;
         private final CursorControllerListener controllerListener = new CursorControllerListener() {
             @Override
             public void onCursorControllerAdded(GVRCursorController controller) {
@@ -493,7 +593,14 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
 
         @Override
         public void onInit(GVRContext context) {
-            GVRScene scene = context.getMainScene();
+            scene = context.getMainScene();
+            loadBackground(context, backgroundIndex);
+            screenFrame = new GVRSceneObject(context, 3.38f, 1.98f);
+            GVRMaterial frameMaterial = new GVRMaterial(context);
+            frameMaterial.setColor(0xff111111);
+            screenFrame.getRenderData().setMaterial(frameMaterial);
+            screenFrame.getTransform().setPosition(0, 0, -2.53f);
+            scene.addSceneObject(screenFrame);
             GVRVideoSceneObject video = new GVRVideoSceneObject(context, 3.2f, 1.8f,
                     new DecoderSurfacePlayer(), GVRVideoSceneObject.GVRVideoType.MONO);
             video.getTransform().setPosition(0, 0, -2.5f);
@@ -524,18 +631,110 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
         }
 
         private void onControllerEvent(GVRCursorController controller) {
-            if (!controller.getKeyEvents().isEmpty()) {
-                android.view.KeyEvent event = controller.getKeyEvents()
-                        .get(controller.getKeyEvents().size() - 1);
+            for (android.view.KeyEvent event : controller.getKeyEvents()) {
+                if (event.getAction() == android.view.KeyEvent.ACTION_DOWN) {
+                    handleControllerKey(event.getKeyCode());
+                }
                 lastInput = android.view.KeyEvent.keyCodeToString(event.getKeyCode())
                         + (event.getAction() == android.view.KeyEvent.ACTION_DOWN ? " pressed" : " released");
-            } else if (!controller.getMotionEvents().isEmpty()) {
-                MotionEvent event = controller.getMotionEvents()
-                        .get(controller.getMotionEvents().size() - 1);
+            }
+            for (MotionEvent event : controller.getMotionEvents()) {
                 lastInput = String.format(Locale.US, "Controller touch x %.2f, y %.2f",
                         event.getX(), event.getY());
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_BUTTON_PRESS) {
+                    touchpadStartX = event.getX();
+                    touchpadLastX = event.getX();
+                    trackingTouchpadSwipe = true;
+                } else if (event.getActionMasked() == MotionEvent.ACTION_MOVE
+                        && trackingTouchpadSwipe) {
+                    float swipeDistance = event.getX() - touchpadLastX;
+                    if (Math.abs(swipeDistance) >= 0.12f) {
+                        performTouchpadSwipe(swipeDistance);
+                        trackingTouchpadSwipe = false;
+                    }
+                    touchpadLastX = event.getX();
+                } else if ((action == MotionEvent.ACTION_UP
+                        || action == MotionEvent.ACTION_BUTTON_RELEASE) && trackingTouchpadSwipe) {
+                    float swipeDistance = event.getX() - touchpadStartX;
+                    if (Math.abs(swipeDistance) >= 0.12f) {
+                        performTouchpadSwipe(swipeDistance);
+                    } else {
+                        toggleTvFrame();
+                    }
+                    trackingTouchpadSwipe = false;
+                } else if (action == MotionEvent.ACTION_CANCEL) {
+                    trackingTouchpadSwipe = false;
+                }
             }
             renderStatus("Controller input detected");
+        }
+
+        private void performTouchpadSwipe(float distance) {
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (now - lastControllerActionMs < 400) return;
+            lastControllerActionMs = now;
+            lastInput = distance < 0 ? "Touchpad swipe left" : "Touchpad swipe right";
+            changeBackground(distance < 0 ? 1 : -1);
+        }
+
+        private void toggleTvFrame() {
+            if (screenFrame == null) return;
+            tvFrameEnabled = !tvFrameEnabled;
+            screenFrame.setEnable(tvFrameEnabled);
+            renderStatus(tvFrameEnabled ? "TV frame layout" : "Floating screen layout");
+        }
+
+        private void changeBackground(int direction) {
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (now - lastBackgroundChangeMs < 400) return;
+            lastBackgroundChangeMs = now;
+            backgroundIndex = (backgroundIndex + direction + BACKGROUND_PATHS.length)
+                    % BACKGROUND_PATHS.length;
+            loadBackground(getGVRContext(), backgroundIndex);
+        }
+
+        private void loadBackground(GVRContext context, int index) {
+            org.gearvrf.GVRTextureParameters parameters = new GVRTextureParameters(context);
+            parameters.setWrapSType(GVRTextureParameters.TextureWrapType.GL_REPEAT);
+            parameters.setWrapTType(GVRTextureParameters.TextureWrapType.GL_CLAMP_TO_EDGE);
+            parameters.setMinFilterType(GVRTextureParameters.TextureFilterType.GL_LINEAR);
+            parameters.setMagFilterType(GVRTextureParameters.TextureFilterType.GL_LINEAR);
+            GVRAndroidResource resource;
+            try {
+                resource = new GVRAndroidResource(context, BACKGROUND_PATHS[index]);
+            } catch (IOException error) {
+                renderStatus("Background unavailable: " + BACKGROUND_NAMES[index]);
+                return;
+            }
+            org.gearvrf.GVRTexture texture = context.getAssetLoader().loadTexture(resource,
+                    new GVRAndroidResource.TextureCallback() {
+                        @Override
+                        public boolean stillWanted(GVRAndroidResource requestedResource) {
+                            return index == backgroundIndex && requestedResource.equals(resource);
+                        }
+
+                        @Override
+                        public void loaded(org.gearvrf.GVRImage image,
+                                           GVRAndroidResource loadedResource) {
+                            renderStatus("Background: " + BACKGROUND_NAMES[index]);
+                        }
+
+                        @Override
+                        public void failed(Throwable error, GVRAndroidResource failedResource) {
+                            renderStatus("Background load failed: " + BACKGROUND_NAMES[index]);
+                        }
+                    }, parameters, 1, 1);
+            if (backgroundObject == null) {
+                backgroundObject = new GVRSphereSceneObject(context, true, texture);
+                backgroundObject.getTransform().setScale(50, 50, 50);
+                backgroundObject.getRenderData().setDepthTest(false);
+                backgroundObject.getRenderData().setDepthMask(false);
+                backgroundObject.getRenderData().setRenderingOrder(-100);
+                scene.addSceneObject(backgroundObject);
+            } else {
+                backgroundObject.getRenderData().getMaterial().setMainTexture(texture);
+            }
         }
     }
 
