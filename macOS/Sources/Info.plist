@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Capture the selected display to stream it to your Gear VR on the local network.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Advertise the Mac sender and stream your selected display to a Gear VR receiver on your local network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_gearvrsender._tcp</string>
+	</array>
+</dict>
+</plist>

@@ -1,0 +1,20 @@
+name: GearVRStreamSender
+options:
+  deploymentTarget:
+    macOS: '13.0'
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: local.gearvr.stream.sender
+    SWIFT_VERSION: '5.0'
+    MACOSX_DEPLOYMENT_TARGET: '13.0'
+    CODE_SIGNING_ALLOWED: 'NO'
+targets:
+  GearVRStreamSender:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_FILE: Sources/Info.plist

@@ -1,0 +1,7 @@
+.gradle/
+build/
+app/build/
+macOS/build/
+macOS/DerivedData/
+macOS/GearVRStreamSender.xcodeproj/
+.DS_Store

@@ -1,0 +1,14 @@
+plugins {
+    id 'java-library'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+def androidSdk = System.getenv('ANDROID_HOME') ?: System.getenv('ANDROID_SDK_ROOT')
+
+dependencies {
+    compileOnly files("${androidSdk}/platforms/android-24/android.jar")
+}

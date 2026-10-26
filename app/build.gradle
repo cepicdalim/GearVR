@@ -1,0 +1,30 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'local.gearvr.stream'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'local.gearvr.stream'
+        minSdk 24
+        targetSdk 28
+        versionCode 1
+        versionName '0.1.0'
+        compileOptions {
+            sourceCompatibility JavaVersion.VERSION_1_8
+            targetCompatibility JavaVersion.VERSION_1_8
+        }
+    }
+
+    dependencies {
+        implementation('org.gearvrf:framework:4.0.0') {
+            exclude group: 'org.joml', module: 'joml-android'
+        }
+        implementation('org.gearvrf:backend_oculus:4.0.0') {
+            exclude group: 'org.joml', module: 'joml-android'
+        }
+        implementation project(':joml-android')
+    }
+}
