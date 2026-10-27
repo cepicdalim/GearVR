@@ -147,23 +147,27 @@ private final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         configuration.width = 1920
         configuration.height = 1080
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-        configuration.queueDepth = 3
+        configuration.queueDepth = 2
         configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         configuration.capturesAudio = false
         configuration.showsCursor = true
 
-        let encoder = try H264Encoder { [weak self] result in
+        let encoder = try H264Encoder { [weak self] result, completion in
             switch result {
             case .success(let sampleBuffer):
-                guard let self else { return }
+                guard let self, let server = self.server else {
+                    completion()
+                    return
+                }
                 let byteCount = CMSampleBufferGetTotalSampleSize(sampleBuffer)
-                self.server?.send(sampleBuffer)
+                server.send(sampleBuffer, completion: completion)
                 self.encodedFrameCount += 1
                 self.encodedByteCount += byteCount
-                    if self.encodedFrameCount.isMultiple(of: 60) {
+                if self.encodedFrameCount.isMultiple(of: 60) {
                     self.onStatus(.success((self.encodedFrameCount, self.encodedByteCount)))
                 }
             case .failure(let error):
+                completion()
                 self?.onStatus(.failure(error))
             }
         }
@@ -194,7 +198,7 @@ private final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
               SCFrameStatus(rawValue: frameStatusValue) == .complete,
               CMSampleBufferGetImageBuffer(sampleBuffer) != nil else { return }
         do {
-            try encoder?.encode(sampleBuffer)
+            try encoder?.encode(sampleBuffer, forceKeyFrame: server?.needsKeyFrame ?? false)
         } catch {
             onStatus(.failure(error))
         }
@@ -206,10 +210,11 @@ private final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 }
 
 private final class H264Encoder {
-    private let onFrameEncoded: (Result<CMSampleBuffer, Error>) -> Void
+    private let onFrameEncoded: (Result<CMSampleBuffer, Error>, @escaping () -> Void) -> Void
+    private let frameSlot = DispatchSemaphore(value: 1)
     private var session: VTCompressionSession?
 
-    init(onFrameEncoded: @escaping (Result<CMSampleBuffer, Error>) -> Void) throws {
+    init(onFrameEncoded: @escaping (Result<CMSampleBuffer, Error>, @escaping () -> Void) -> Void) throws {
         self.onFrameEncoded = onFrameEncoded
         var createdSession: VTCompressionSession?
         let status = VTCompressionSessionCreate(
@@ -217,17 +222,25 @@ private final class H264Encoder {
             width: 1920,
             height: 1080,
             codecType: kCMVideoCodecType_H264,
-            encoderSpecification: [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true] as CFDictionary,
+            encoderSpecification: [
+                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true,
+                kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true
+            ] as CFDictionary,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
-            outputCallback: { refcon, _, status, _, sampleBuffer in
+            outputCallback: { refcon, _, status, flags, sampleBuffer in
                 guard let refcon else { return }
                 let encoder = Unmanaged<H264Encoder>.fromOpaque(refcon).takeUnretainedValue()
-                guard status == noErr, let sampleBuffer, CMSampleBufferDataIsReady(sampleBuffer) else {
-                    encoder.onFrameEncoded(.failure(EncoderError.encodingFailed(status)))
+                let completion = { encoder.frameSlot.signal(); return }
+                if status == noErr && flags.contains(.frameDropped) {
+                    completion()
                     return
                 }
-                encoder.onFrameEncoded(.success(sampleBuffer))
+                guard status == noErr, let sampleBuffer, CMSampleBufferDataIsReady(sampleBuffer) else {
+                    encoder.onFrameEncoded(.failure(EncoderError.encodingFailed(status)), completion)
+                    return
+                }
+                encoder.onFrameEncoded(.success(sampleBuffer), completion)
             },
             refcon: Unmanaged.passUnretained(self).toOpaque(),
             compressionSessionOut: &createdSession
@@ -240,27 +253,37 @@ private final class H264Encoder {
                              value: kCFBooleanTrue)
         VTSessionSetProperty(createdSession, key: kVTCompressionPropertyKey_AllowFrameReordering,
                              value: kCFBooleanFalse)
-        VTSessionSetProperty(createdSession, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                             value: 60 as CFNumber)
+        VTSessionSetProperty(createdSession, key: kVTCompressionPropertyKey_ExpectedFrameRate,
+                     value: 60 as CFNumber)
+        VTSessionSetProperty(createdSession, key: kVTCompressionPropertyKey_ProfileLevel,
+                     value: kVTProfileLevel_H264_High_AutoLevel)
         VTSessionSetProperty(createdSession, key: kVTCompressionPropertyKey_AverageBitRate,
-                             value: 18_000_000 as CFNumber)
+                     value: 35_000_000 as CFNumber)
+        VTSessionSetProperty(createdSession, key: kVTCompressionPropertyKey_MaxAllowedFrameQP,
+                     value: 20 as CFNumber)
         VTCompressionSessionPrepareToEncodeFrames(createdSession)
     }
 
-    func encode(_ sampleBuffer: CMSampleBuffer) throws {
+    func encode(_ sampleBuffer: CMSampleBuffer, forceKeyFrame: Bool) throws {
         guard let session, let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard frameSlot.wait(timeout: .now()) == .success else { return }
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let duration = CMSampleBufferGetDuration(sampleBuffer)
+        let frameProperties = forceKeyFrame
+            ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
         let status = VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: imageBuffer,
             presentationTimeStamp: presentationTime,
             duration: duration,
-            frameProperties: nil,
+            frameProperties: frameProperties,
             sourceFrameRefcon: nil,
             infoFlagsOut: nil
         )
-        guard status == noErr else { throw EncoderError.encodingFailed(status) }
+        guard status == noErr else {
+            frameSlot.signal()
+            throw EncoderError.encodingFailed(status)
+        }
     }
 
     func invalidate() {
@@ -289,7 +312,13 @@ private final class VideoServer {
     private var listener: NWListener?
     private var connection: NWConnection?
     private var sentConfiguration = false
-    private var sendInProgress = false
+
+    var needsKeyFrame: Bool {
+        queue.sync {
+            guard let connection, case .ready = connection.state else { return false }
+            return !sentConfiguration
+        }
+    }
 
     init(onStatus: @escaping (String) -> Void) {
         self.onStatus = onStatus
@@ -300,7 +329,10 @@ private final class VideoServer {
             guard let self else { return }
             do {
                 let port = NWEndpoint.Port(rawValue: UInt16(StreamProtocol.signalingPort))!
-                let listener = try NWListener(using: .tcp, on: port)
+                let tcp = NWProtocolTCP.Options()
+                tcp.noDelay = true
+                let parameters = NWParameters(tls: nil, tcp: tcp)
+                let listener = try NWListener(using: parameters, on: port)
                     listener.service = NWListener.Service(name: "GearVR Stream", type: StreamProtocol.senderServiceType)
                 listener.newConnectionHandler = { [weak self] connection in
                     self?.accept(connection)
@@ -326,16 +358,21 @@ private final class VideoServer {
             self?.connection = nil
             self?.listener?.cancel()
             self?.listener = nil
-            self?.sendInProgress = false
             self?.onStatus("Server stopped")
         }
     }
 
-    func send(_ sampleBuffer: CMSampleBuffer) {
+    func send(_ sampleBuffer: CMSampleBuffer, completion: @escaping () -> Void) {
         queue.async { [weak self] in
             guard let self, let connection = self.connection,
-                  case .ready = connection.state, !self.sendInProgress else { return }
-            if !self.sentConfiguration && !self.isKeyFrame(sampleBuffer) { return }
+                  case .ready = connection.state else {
+                completion()
+                return
+            }
+            if !self.sentConfiguration && !self.isKeyFrame(sampleBuffer) {
+                completion()
+                return
+            }
             do {
                 var packet = Data()
                 if !self.sentConfiguration {
@@ -343,12 +380,11 @@ private final class VideoServer {
                     self.sentConfiguration = true
                 }
                 packet.append(try self.framePacket(for: sampleBuffer))
-                self.sendInProgress = true
                 connection.send(content: packet, completion: .contentProcessed { [weak self] error in
+                    completion()
                     guard let self else { return }
                     self.queue.async {
                         guard self.connection === connection else { return }
-                        self.sendInProgress = false
                         if let error {
                             self.onStatus("Stream send failed: \(error.localizedDescription)")
                             connection.cancel()
@@ -358,11 +394,11 @@ private final class VideoServer {
                     }
                 })
             } catch {
+                completion()
                 self.onStatus("Stream send failed: \(error.localizedDescription)")
                 connection.cancel()
                 self.connection = nil
                 self.sentConfiguration = false
-                self.sendInProgress = false
             }
         }
     }
@@ -371,7 +407,6 @@ private final class VideoServer {
         self.connection?.cancel()
         self.connection = connection
         sentConfiguration = false
-        sendInProgress = false
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             guard let self, let connection else { return }
             if case .ready = state {
@@ -389,7 +424,6 @@ private final class VideoServer {
         guard self.connection === connection else { return }
         self.connection = nil
         self.sentConfiguration = false
-        self.sendInProgress = false
         onStatus("Server ready; waiting for Gear VR receiver")
     }
 

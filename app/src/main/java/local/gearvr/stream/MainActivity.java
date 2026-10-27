@@ -1,10 +1,11 @@
 package local.gearvr.stream;
 
 import android.content.Context;
-import android.hardware.Sensor;
-import android.hardware.SensorEvent;
-import android.hardware.SensorEventListener;
-import android.hardware.SensorManager;
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.hardware.Camera;
+import android.view.MotionEvent;
+import android.widget.Toast;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
 import android.net.ConnectivityManager;
@@ -14,13 +15,12 @@ import android.net.wifi.WifiManager;
 import android.net.wifi.WifiInfo;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.util.Log;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
 import android.view.Surface;
-import android.view.InputDevice;
-import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 
@@ -29,13 +29,15 @@ import org.gearvrf.GVRAndroidResource;
 import org.gearvrf.GVRContext;
 import org.gearvrf.GVRMain;
 import org.gearvrf.GVRMaterial;
+import org.gearvrf.GVRMeshCollider;
+import org.gearvrf.GVRPicker;
 import org.gearvrf.GVRScene;
-import org.gearvrf.GVRTextureParameters;
 import org.gearvrf.GVRSceneObject;
+import org.gearvrf.GVRTextureParameters;
 import org.gearvrf.GVRCursorController;
 import org.gearvrf.io.CursorControllerListener;
 import org.gearvrf.io.GVRControllerType;
-import org.gearvrf.scene_objects.GVRTextViewSceneObject;
+import org.gearvrf.scene_objects.GVRLineSceneObject;
 import org.gearvrf.scene_objects.GVRSphereSceneObject;
 import org.gearvrf.scene_objects.GVRVideoSceneObject;
 import org.gearvrf.scene_objects.GVRVideoSceneObjectPlayer;
@@ -49,9 +51,12 @@ import java.net.InetAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.Locale;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
-public final class MainActivity extends GVRActivity implements SensorEventListener {
+public final class MainActivity extends GVRActivity {
+    private static final int CAMERA_PERMISSION_REQUEST = 41;
     private static final int MAX_PACKET_SIZE = 16 * 1024 * 1024;
     private static final byte[] START_CODE = {0, 0, 0, 1};
     private static final String[] BACKGROUND_PATHS = {
@@ -74,9 +79,10 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
         "Misty pines", "Snowy forest", "Autumn field", "Mountain dawn",
         "Sunset coast", "Venice sunset", "Isar river", "Starry night"
     };
-    private final float[] rotation = new float[3];
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private SensorManager sensorManager;
+    private final CameraSurfacePlayer cameraPlayer = new CameraSurfacePlayer();
+    private volatile boolean activityResumed;
+    private volatile boolean cameraRequested;
     private NsdManager nsdManager;
     private WifiManager.MulticastLock multicastLock;
     private NsdManager.DiscoveryListener discoveryListener;
@@ -89,18 +95,39 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
     private volatile String activeSenderEndpoint;
     private Thread receiverThread;
     private MediaCodec decoder;
+    private HandlerThread decoderThread;
+    private Handler decoderHandler;
+    private final Runnable drainDecoder = new Runnable() {
+        @Override
+        public void run() {
+            synchronized (MainActivity.this) {
+                if (!decoderConfigured || decoder == null || decoderHandler == null) return;
+                try {
+                    drainDecoderOutput(decoder);
+                    decoderHandler.postDelayed(this, 2);
+                } catch (IllegalStateException error) {
+                    Log.e("GearVRStream", "H.264 output drain failed", error);
+                    releaseDecoder();
+                    showReceiverError("H.264 output failed: " + error.getMessage());
+                }
+            }
+        }
+    };
     private volatile boolean decoderConfigured;
     private int videoWidth;
     private int videoHeight;
     private volatile byte[] videoSps;
     private volatile byte[] videoPps;
-    private volatile String lastInput = "Waiting for controller input";
     private volatile String discoveredSender = "Searching local network for a Mac sender...";
-    private volatile String statusHeading = "Receiver ready";
-    private volatile String sceneStatusText = "";
-    private volatile GVRTextViewSceneObject vrStatus;
     private volatile StreamVrMain vrMain;
-    private long lastControllerActionMs;
+
+    @Override
+    protected void onInitAppSettings(org.gearvrf.utility.VrAppSettings settings) {
+        settings.getEyeBufferParams().setResolutionWidth(1536);
+        settings.getEyeBufferParams().setResolutionHeight(1536);
+        settings.getEyeBufferParams().setMultiSamples(4);
+        super.onInitAppSettings(settings);
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -114,65 +141,54 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
                         | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
                         | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
 
-        sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
         nsdManager = (NsdManager) getSystemService(Context.NSD_SERVICE);
         WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         multicastLock = wifiManager.createMulticastLock("gearvr-stream-discovery");
         multicastLock.setReferenceCounted(false);
         vrMain = new StreamVrMain();
         setMain(vrMain);
-        renderStatus("VR receiver starting");
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        statusHeading = "Receiver foregrounded";
+        activityResumed = true;
+        cameraPlayer.start();
         startDiscovery();
-        Sensor rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR);
-        if (rotationSensor == null) {
-            rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
-        }
-        if (rotationSensor != null) {
-            sensorManager.registerListener(this, rotationSensor, SensorManager.SENSOR_DELAY_GAME);
-        }
-        renderStatus("Head tracking active");
     }
 
     @Override
     protected void onPause() {
-        statusHeading = "Receiver paused";
-        sensorManager.unregisterListener(this);
+        activityResumed = false;
+        cameraPlayer.pause();
         stopDiscovery();
         stopReceiver();
+        if (vrMain != null && vrMain.getGVRContext() != null) {
+            vrMain.getGVRContext().runOnGlThread(vrMain::resetInteraction);
+        }
         super.onPause();
     }
 
     @Override
-    public boolean dispatchKeyEvent(android.view.KeyEvent event) {
-        if (event.getAction() == android.view.KeyEvent.ACTION_DOWN && vrMain != null
-                && handleControllerKey(event.getKeyCode())) {
-            return true;
-        }
-        return super.dispatchKeyEvent(event);
+    protected void onDestroy() {
+        activityResumed = false;
+        cameraPlayer.release();
+        super.onDestroy();
     }
 
-    private boolean handleControllerKey(int keyCode) {
-        if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_RIGHT
-                || keyCode == android.view.KeyEvent.KEYCODE_BUTTON_R1) {
-            vrMain.changeBackground(1);
-        } else if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_LEFT
-                || keyCode == android.view.KeyEvent.KEYCODE_BUTTON_L1) {
-            vrMain.changeBackground(-1);
-        } else if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_CENTER
-                || keyCode == android.view.KeyEvent.KEYCODE_BUTTON_A) {
-            vrMain.toggleTvFrame();
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode != CAMERA_PERMISSION_REQUEST) return;
+        if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
+            if (vrMain != null && vrMain.getGVRContext() != null) {
+                vrMain.getGVRContext().runOnGlThread(() ->
+                        vrMain.applyPaletteSelection(BACKGROUND_PATHS.length));
+            }
         } else {
-            return false;
+            Toast.makeText(this, "Camera permission is needed for the Camera scene",
+                    Toast.LENGTH_LONG).show();
         }
-        lastInput = android.view.KeyEvent.keyCodeToString(keyCode) + " pressed";
-        renderStatus("Controller input detected");
-        return true;
     }
 
     private void startDiscovery() {
@@ -186,7 +202,6 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
             public void onDiscoveryStarted(String serviceType) {
                 runOnUiThread(() -> {
                     discoveredSender = "Searching local network for a Mac sender...";
-                    renderStatus("Searching for Mac sender");
                 });
             }
 
@@ -197,7 +212,6 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
                 }
                 runOnUiThread(() -> {
                     discoveredSender = "Found sender: " + service.getServiceName() + ", resolving...";
-                    renderStatus("Receiver diagnostics only");
                 });
                 nsdManager.resolveService(service, new NsdManager.ResolveListener() {
                     @Override
@@ -205,7 +219,6 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
                         tryFallbackDiscovery();
                         runOnUiThread(() -> {
                             discoveredSender = "Sender found, address lookup failed (" + errorCode + ")";
-                            renderStatus("Sender address lookup failed");
                         });
                     }
 
@@ -217,7 +230,6 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
                         runOnUiThread(() -> {
                             discoveredSender = "Found " + resolved.getServiceName() + " at "
                                     + resolved.getHost().getHostAddress() + ":" + resolved.getPort();
-                            renderStatus("Connecting to Mac sender");
                         });
                     }
                 });
@@ -227,7 +239,6 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
             public void onServiceLost(NsdServiceInfo service) {
                 runOnUiThread(() -> {
                     discoveredSender = "Searching local network for a Mac sender...";
-                    renderStatus("Searching for Mac sender");
                 });
             }
 
@@ -243,7 +254,6 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
                 releaseMulticastLock();
                 runOnUiThread(() -> {
                     discoveredSender = "Network discovery unavailable (" + errorCode + ")";
-                    renderStatus("Network discovery failed");
                 });
             }
 
@@ -314,7 +324,6 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
                         service.setPort(43129);
                         connectToSender(service);
                         discoveredSender = "Found sender at " + candidate.getHostAddress();
-                        renderStatus("Connected to Mac sender");
                     });
                 } catch (IOException ignored) {
                 }
@@ -323,7 +332,6 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
                 runOnUiThread(() -> {
                     if (!receiverRunning) {
                         discoveredSender = "No sender found on this Wi-Fi subnet";
-                        renderStatus("Check Wi-Fi and firewall");
                     }
                 });
             }
@@ -379,7 +387,6 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
             DataInputStream input = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
             runOnUiThread(() -> {
                 discoveredSender = "Connected to " + host + ":" + service.getPort() + ", waiting for video";
-                renderStatus("Video connection active");
             });
             while (receiverRunning && !Thread.currentThread().isInterrupted()) {
                 int packetLength = input.readInt();
@@ -461,18 +468,23 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
             decoder.configure(format, decoderSurface, null, 0);
             decoder.start();
             decoderConfigured = true;
+                decoderThread = new HandlerThread("gearvr-video-output",
+                    android.os.Process.THREAD_PRIORITY_DISPLAY);
+                decoderThread.start();
+                decoderHandler = new Handler(decoderThread.getLooper());
+                decoderHandler.post(drainDecoder);
             runOnUiThread(() -> {
                 discoveredSender = "Receiving " + width + " x " + height + " H.264";
-                renderStatus("Video stream active");
             });
         } catch (Exception error) {
-            decoderConfigured = false;
+            releaseDecoder();
+            Log.e("GearVRStream", "H.264 decoder configuration failed", error);
             showReceiverError("H.264 decoder failed: " + error.getMessage());
         }
     }
 
     private synchronized void decodeFrame(byte[] packet) throws IOException {
-        if (packet.length < 9 || decoder == null) return;
+        if (packet.length < 9 || decoder == null || !decoderConfigured) return;
         ByteBuffer data = ByteBuffer.wrap(packet).order(java.nio.ByteOrder.BIG_ENDIAN);
         long presentationTimeUs = data.getLong();
         boolean keyFrame = data.get() != 0;
@@ -481,23 +493,38 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
         byte[] annexB = toAnnexB(accessUnit);
         MediaCodec activeDecoder = decoder;
         if (activeDecoder == null) return;
-        int inputIndex = activeDecoder.dequeueInputBuffer(10000);
-        if (inputIndex >= 0) {
-            ByteBuffer input = activeDecoder.getInputBuffer(inputIndex);
-            if (input != null && input.remaining() >= annexB.length) {
-                input.clear();
-                input.put(annexB);
-                activeDecoder.queueInputBuffer(inputIndex, 0, annexB.length,
-                        Math.max(0, presentationTimeUs), keyFrame ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0);
-            } else {
-                activeDecoder.queueInputBuffer(inputIndex, 0, 0, 0, 0);
+        drainDecoderOutput(activeDecoder);
+        int inputIndex = activeDecoder.dequeueInputBuffer(0);
+        while (inputIndex < 0 && receiverRunning && !Thread.currentThread().isInterrupted()) {
+            drainDecoderOutput(activeDecoder);
+            inputIndex = activeDecoder.dequeueInputBuffer(2000);
+        }
+        if (inputIndex < 0) return;
+        ByteBuffer input = activeDecoder.getInputBuffer(inputIndex);
+        if (input == null) throw new IOException("H.264 decoder input buffer unavailable");
+        input.clear();
+        if (input.remaining() < annexB.length) {
+            throw new IOException("H.264 frame exceeds decoder input capacity");
+        }
+        input.put(annexB);
+        activeDecoder.queueInputBuffer(inputIndex, 0, annexB.length,
+                Math.max(0, presentationTimeUs), keyFrame ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0);
+        drainDecoderOutput(activeDecoder);
+    }
+
+    private void drainDecoderOutput(MediaCodec activeDecoder) {
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        int newestOutput = -1;
+        while (true) {
+            int outputIndex = activeDecoder.dequeueOutputBuffer(info, 0);
+            if (outputIndex >= 0) {
+                if (newestOutput >= 0) activeDecoder.releaseOutputBuffer(newestOutput, false);
+                newestOutput = outputIndex;
+            } else if (outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                break;
             }
         }
-        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-        int outputIndex;
-        while ((outputIndex = activeDecoder.dequeueOutputBuffer(info, 0)) >= 0) {
-            activeDecoder.releaseOutputBuffer(outputIndex, true);
-        }
+        if (newestOutput >= 0) activeDecoder.releaseOutputBuffer(newestOutput, true);
     }
 
     private byte[] toAnnexB(byte[] accessUnit) throws IOException {
@@ -522,6 +549,11 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
     }
 
     private synchronized void releaseDecoder() {
+        decoderConfigured = false;
+        if (decoderHandler != null) decoderHandler.removeCallbacksAndMessages(null);
+        decoderHandler = null;
+        if (decoderThread != null) decoderThread.quitSafely();
+        decoderThread = null;
         MediaCodec activeDecoder = decoder;
         decoder = null;
         if (activeDecoder != null) {
@@ -533,156 +565,536 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
     private void showReceiverError(String message) {
         runOnUiThread(() -> {
             discoveredSender = message;
-            renderStatus("Video receiver error");
         });
     }
 
-    @Override
-    public void onSensorChanged(SensorEvent event) {
-        if (event.sensor.getType() == Sensor.TYPE_GAME_ROTATION_VECTOR
-                || event.sensor.getType() == Sensor.TYPE_ROTATION_VECTOR) {
-            float[] matrix = new float[9];
-            SensorManager.getRotationMatrixFromVector(matrix, event.values);
-            float[] orientation = new float[3];
-            SensorManager.getOrientation(matrix, orientation);
-            rotation[0] = (float) Math.toDegrees(orientation[0]);
-            rotation[1] = (float) Math.toDegrees(orientation[1]);
-            rotation[2] = (float) Math.toDegrees(orientation[2]);
-            renderStatus("Head tracking active");
-        }
-    }
-
-    @Override
-    public void onAccuracyChanged(Sensor sensor, int accuracy) {
-    }
-
-    private void renderStatus(String heading) {
-        statusHeading = heading;
-        sceneStatusText = String.format(Locale.US,
-                "GEAR VR STREAM  |  %s\n%s\nHead %+.0f / %+.0f / %+.0f  |  %s",
-                statusHeading, discoveredSender, rotation[0], rotation[1], rotation[2], lastInput);
-    }
-
     private final class StreamVrMain extends GVRMain {
-        private GVRTextViewSceneObject statusObject;
-        private String renderedStatus;
         private GVRScene scene;
         private GVRSphereSceneObject backgroundObject;
         private GVRSceneObject screenFrame;
+        private GVRSceneObject paletteRoot;
+        private GVRSceneObject[] paletteItems;
+        private GVRMaterial[] paletteMaterials;
+        private GVRSceneObject hoveredPaletteItem;
+        private GVRSceneObject laserHitDot;
         private int backgroundIndex;
         private long lastBackgroundChangeMs;
-        private boolean tvFrameEnabled = true;
-        private float touchpadStartX;
-        private boolean trackingTouchpadSwipe;
-        private float touchpadLastX;
+        private boolean paletteVisible;
+        private GVRCursorController activeController;
+        private GVRSceneObject laserObject;
+        private GVRSceneObject controllerPose;
+        private GVRSceneObject videoObject;
+        private GVRSceneObject cameraObject;
+        private float screenOpacity = 0.75f;
+        private boolean slidingTransparency;
+        private float lastTouchX;
+        private GVRSceneObject pressedPaletteItem;
+        private boolean touchpadPressed;
+        private boolean triggerPressed;
+        private long lastPointerFrameMs;
+        private int pickingCheckFrames;
+        private final ArrayList<GVRCursorController> controllers = new ArrayList<>();
+        private final ConcurrentLinkedQueue<android.view.KeyEvent> buttonEvents =
+                new ConcurrentLinkedQueue<>();
+        private final ConcurrentLinkedQueue<MotionEvent> touchEvents =
+            new ConcurrentLinkedQueue<>();
+        private final org.joml.Matrix4f pointerMatrix = new org.joml.Matrix4f();
+        private final org.joml.Vector3f rayOrigin = new org.joml.Vector3f();
+        private final org.joml.Vector3f rayDirection = new org.joml.Vector3f();
+        private final GVRCursorController.ControllerEventListener buttonListener =
+                this::onControllerEvent;
         private final CursorControllerListener controllerListener = new CursorControllerListener() {
             @Override
             public void onCursorControllerAdded(GVRCursorController controller) {
-                controller.addControllerEventListener(StreamVrMain.this::onControllerEvent);
-                lastInput = "Controller connected: " + controller.getControllerType();
-                renderStatus("Controller ready");
+                getGVRContext().runOnGlThread(() -> {
+                    if (controllers.contains(controller)) return;
+                    controllers.add(controller);
+                    controller.addControllerEventListener(buttonListener);
+                    chooseController();
+                });
             }
 
             @Override
             public void onCursorControllerRemoved(GVRCursorController controller) {
-                controller.removeControllerEventListener(StreamVrMain.this::onControllerEvent);
-                lastInput = "Controller disconnected";
-                renderStatus("Controller disconnected");
+                getGVRContext().runOnGlThread(() -> {
+                    controller.removeControllerEventListener(buttonListener);
+                    controllers.remove(controller);
+                    if (activeController == controller) {
+                        detachController();
+                        chooseController();
+                    }
+                });
             }
         };
 
         @Override
         public void onInit(GVRContext context) {
+            Log.i("GearVRStream", "Eye buffer settings: " + getAppSettings().getEyeBufferParams());
             scene = context.getMainScene();
             loadBackground(context, backgroundIndex);
-            screenFrame = new GVRSceneObject(context, 3.38f, 1.98f);
+            screenFrame = new GVRSceneObject(context, 4.38f, 2.54f);
             GVRMaterial frameMaterial = new GVRMaterial(context);
             frameMaterial.setColor(0xff111111);
             screenFrame.getRenderData().setMaterial(frameMaterial);
+            screenFrame.getRenderData().setDepthMask(false);
             screenFrame.getTransform().setPosition(0, 0, -2.53f);
+            screenFrame.attachCollider(new GVRMeshCollider(context, false));
             scene.addSceneObject(screenFrame);
-            GVRVideoSceneObject video = new GVRVideoSceneObject(context, 3.2f, 1.8f,
+            createBackgroundPalette(context);
+            GVRVideoSceneObject video = new GVRVideoSceneObject(context, 4.2f, 2.3625f,
                     new DecoderSurfacePlayer(), GVRVideoSceneObject.GVRVideoType.MONO);
+                GVRTextureParameters videoParameters = new GVRTextureParameters(context);
+                videoParameters.setMinFilterType(GVRTextureParameters.TextureFilterType.GL_LINEAR);
+                videoParameters.setMagFilterType(GVRTextureParameters.TextureFilterType.GL_LINEAR);
+                videoParameters.setWrapSType(GVRTextureParameters.TextureWrapType.GL_CLAMP_TO_EDGE);
+                videoParameters.setWrapTType(GVRTextureParameters.TextureWrapType.GL_CLAMP_TO_EDGE);
+                video.getRenderData().getMaterial().getMainTexture().updateTextureParameters(videoParameters);
             video.getTransform().setPosition(0, 0, -2.5f);
+            video.attachCollider(new GVRMeshCollider(context, false));
+            videoObject = video;
             scene.addSceneObject(video);
+            createLaserHitDot(context);
+            togglePalette();
 
-            statusObject = new GVRTextViewSceneObject(context, 2.7f, 0.35f, sceneStatusText);
-            statusObject.setTextSize(20);
-            statusObject.setTextColor(0xfff2f5f7);
-            statusObject.setBackgroundColor(0xaa101820);
-            statusObject.getTransform().setPosition(0, -1.15f, -2.4f);
-            scene.addSceneObject(statusObject);
-            vrStatus = statusObject;
+                Log.i("GearVRStream", "VR scene initialized: palette=" + paletteVisible
+                    + " tiles=" + paletteItems.length + " videoSurface=" + (decoderSurface != null));
 
             context.getInputManager().addCursorControllerListener(controllerListener);
             for (GVRCursorController controller : context.getInputManager().getCursorControllers()) {
                 controllerListener.onCursorControllerAdded(controller);
             }
-            renderStatus("Stereo VR scene ready");
         }
 
         @Override
         public void onStep() {
-            String text = sceneStatusText;
-            if (statusObject != null && !text.equals(renderedStatus)) {
-                renderedStatus = text;
-                statusObject.setText(text);
+            if (++pickingCheckFrames == 120) {
+                int hitCount = 0;
+                for (GVRSceneObject item : paletteItems) {
+                    float[] model = item.getTransform().getModelMatrix();
+                    org.joml.Vector3f direction = new org.joml.Vector3f(
+                            model[12], model[13], model[14]).normalize();
+                    GVRPicker.GVRPickedObject hit = GVRPicker.pickSceneObject(item,
+                        0f, 0f, 0f, direction.x, direction.y, direction.z);
+                    if (hit != null && hit.hitObject == item && hit.hitDistance > 0f) hitCount++;
+                }
+                Log.i("GearVRStream", "Palette mesh hit check: " + hitCount + "/" + paletteItems.length);
+            }
+            updatePointer();
+            android.view.KeyEvent event;
+            while ((event = buttonEvents.poll()) != null) {
+                handleButton(event);
+                updatePointer();
+            }
+            MotionEvent touch;
+            while ((touch = touchEvents.poll()) != null) {
+                handleTouch(touch);
+                touch.recycle();
+            }
+            animatePaletteHover();
+        }
+
+        private void updatePointer() {
+            if (laserObject == null || laserHitDot == null || controllerPose == null) return;
+            laserObject.setEnable(paletteVisible);
+            if (!paletteVisible) {
+                laserHitDot.setEnable(false);
+                return;
+            }
+            pointerMatrix.set(controllerPose.getTransform().getModelMatrix());
+            pointerMatrix.transformPosition(0f, 0f, 0f, rayOrigin);
+            pointerMatrix.transformDirection(0f, 0f, -1f, rayDirection);
+            if (rayDirection.lengthSquared() < 0.000001f) {
+                laserObject.setEnable(false);
+                laserHitDot.setEnable(false);
+                if (hoveredPaletteItem != null) clearPaletteHover(hoveredPaletteItem);
+                return;
+            }
+            rayDirection.normalize();
+            GVRPicker.GVRPickedObject nearest = null;
+            GVRSceneObject nearestTarget = null;
+                for (int index = 0; index < paletteItems.length + 2; index++) {
+                GVRSceneObject target = index < paletteItems.length ? paletteItems[index]
+                    : (index == paletteItems.length ? videoObject : screenFrame);
+                GVRPicker.GVRPickedObject hit = GVRPicker.pickSceneObject(target,
+                    rayOrigin.x, rayOrigin.y, rayOrigin.z,
+                    rayDirection.x, rayDirection.y, rayDirection.z);
+                if (hit == null) continue;
+                if (hit.hitDistance > 0f && hit.hitDistance <= 12f
+                        && (nearest == null || hit.hitDistance < nearest.hitDistance)) {
+                    nearest = hit;
+                    nearestTarget = target;
+                }
+            }
+            GVRSceneObject hitItem = nearest != null && isPaletteItem(nearest.hitObject)
+                    ? nearest.hitObject : null;
+            if (hoveredPaletteItem != null && hoveredPaletteItem != hitItem) {
+                clearPaletteHover(hoveredPaletteItem);
+            }
+            if (hitItem != null) updatePaletteHover(hitItem);
+            float distance = nearest == null ? 12f : nearest.hitDistance;
+            laserObject.getTransform().setScale(1f, 1f, distance / 12f);
+            if (nearest == null) {
+                laserHitDot.setEnable(false);
+            } else {
+                float dotDistance = Math.max(0f, distance - 0.012f);
+                laserHitDot.getTransform().setPosition(
+                        rayOrigin.x + rayDirection.x * dotDistance,
+                        rayOrigin.y + rayDirection.y * dotDistance,
+                        rayOrigin.z + rayDirection.z * dotDistance);
+                float dotScale = Math.max(0.5f, Math.min(3f, distance / 2f));
+                laserHitDot.getTransform().setScale(dotScale, dotScale, dotScale);
+                laserHitDot.setEnable(true);
+            }
+        }
+
+        private boolean isPaletteItem(GVRSceneObject object) {
+            return object != null && object.getParent() == paletteRoot && paletteVisible;
+        }
+
+        private void animatePaletteHover() {
+            long now = android.os.SystemClock.elapsedRealtime();
+            float elapsed = lastPointerFrameMs == 0 ? 1f / 60f
+                    : Math.min(0.05f, (now - lastPointerFrameMs) / 1000f);
+            lastPointerFrameMs = now;
+            float blend = 1f - (float) Math.exp(-18f * elapsed);
+            for (GVRSceneObject item : paletteItems) {
+                float target = item == hoveredPaletteItem ? 1.06f : 1f;
+                float scale = item.getTransform().getScaleX();
+                scale += (target - scale) * blend;
+                item.getTransform().setScale(scale, scale, 1f);
+                int index = (Integer) item.getTag();
+                paletteMaterials[index].setColor(item == hoveredPaletteItem
+                        ? (triggerPressed && pressedPaletteItem == item ? 0xffffffff : 0xffe07a32)
+                        : (index == backgroundIndex ? 0xff168aad : 0xff263744));
             }
         }
 
         private void onControllerEvent(GVRCursorController controller) {
             for (android.view.KeyEvent event : controller.getKeyEvents()) {
-                if (event.getAction() == android.view.KeyEvent.ACTION_DOWN) {
-                    handleControllerKey(event.getKeyCode());
-                }
-                lastInput = android.view.KeyEvent.keyCodeToString(event.getKeyCode())
-                        + (event.getAction() == android.view.KeyEvent.ACTION_DOWN ? " pressed" : " released");
+                android.view.KeyEvent copy = new android.view.KeyEvent(event);
+                getGVRContext().runOnGlThread(() -> {
+                    if (controller == activeController) buttonEvents.add(copy);
+                });
             }
-            for (MotionEvent event : controller.getMotionEvents()) {
-                lastInput = String.format(Locale.US, "Controller touch x %.2f, y %.2f",
-                        event.getX(), event.getY());
+            if (controller.getControllerType() == GVRControllerType.CONTROLLER) {
+                for (MotionEvent event : controller.getMotionEvents()) {
+                    MotionEvent copy = MotionEvent.obtain(event);
+                    getGVRContext().runOnGlThread(() -> {
+                        if (controller == activeController) touchEvents.add(copy);
+                        else copy.recycle();
+                    });
+                }
+            }
+        }
+
+        private void handleTouch(MotionEvent event) {
+            if (!cameraRequested || paletteVisible || touchpadPressed) {
+                slidingTransparency = false;
+                return;
+            }
             int action = event.getActionMasked();
-            if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_BUTTON_PRESS) {
-                    touchpadStartX = event.getX();
-                    touchpadLastX = event.getX();
-                    trackingTouchpadSwipe = true;
-                } else if (event.getActionMasked() == MotionEvent.ACTION_MOVE
-                        && trackingTouchpadSwipe) {
-                    float swipeDistance = event.getX() - touchpadLastX;
-                    if (Math.abs(swipeDistance) >= 0.12f) {
-                        performTouchpadSwipe(swipeDistance);
-                        trackingTouchpadSwipe = false;
-                    }
-                    touchpadLastX = event.getX();
-                } else if ((action == MotionEvent.ACTION_UP
-                        || action == MotionEvent.ACTION_BUTTON_RELEASE) && trackingTouchpadSwipe) {
-                    float swipeDistance = event.getX() - touchpadStartX;
-                    if (Math.abs(swipeDistance) >= 0.12f) {
-                        performTouchpadSwipe(swipeDistance);
-                    } else {
-                        toggleTvFrame();
-                    }
-                    trackingTouchpadSwipe = false;
-                } else if (action == MotionEvent.ACTION_CANCEL) {
-                    trackingTouchpadSwipe = false;
-                }
+            if (action == MotionEvent.ACTION_DOWN) {
+                lastTouchX = event.getX();
+                slidingTransparency = true;
+            } else if (action == MotionEvent.ACTION_MOVE && slidingTransparency) {
+                float touchX = event.getX();
+                screenOpacity = Math.max(0f, Math.min(1f,
+                        screenOpacity + (touchX - lastTouchX)));
+                lastTouchX = touchX;
+                updateScreenOpacity();
+            } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                slidingTransparency = false;
             }
-            renderStatus("Controller input detected");
         }
 
-        private void performTouchpadSwipe(float distance) {
-            long now = android.os.SystemClock.elapsedRealtime();
-            if (now - lastControllerActionMs < 400) return;
-            lastControllerActionMs = now;
-            lastInput = distance < 0 ? "Touchpad swipe left" : "Touchpad swipe right";
-            changeBackground(distance < 0 ? 1 : -1);
+        private void resetTouch() {
+            slidingTransparency = false;
+            MotionEvent touch;
+            while ((touch = touchEvents.poll()) != null) touch.recycle();
         }
 
-        private void toggleTvFrame() {
-            if (screenFrame == null) return;
-            tvFrameEnabled = !tvFrameEnabled;
-            screenFrame.setEnable(tvFrameEnabled);
-            renderStatus(tvFrameEnabled ? "TV frame layout" : "Floating screen layout");
+        private void updateScreenOpacity() {
+            float opacity = cameraRequested ? screenOpacity : 1f;
+            for (GVRSceneObject object : new GVRSceneObject[] {videoObject, screenFrame}) {
+                object.getRenderData().getMaterial().setOpacity(opacity);
+                object.getRenderData().setAlphaBlend(cameraRequested);
+                object.getRenderData().setDepthMask(object == videoObject && !cameraRequested);
+            }
+            screenFrame.getRenderData().setRenderingOrder(1000);
+            videoObject.getRenderData().setRenderingOrder(1001);
+                videoObject.getRenderData().setAlphaBlendFunc(
+                    android.opengl.GLES20.GL_ONE, android.opengl.GLES20.GL_ONE_MINUS_SRC_ALPHA);
+        }
+
+        private void handleButton(android.view.KeyEvent event) {
+            if (event.isCanceled()) {
+                pressedPaletteItem = null;
+                touchpadPressed = false;
+                triggerPressed = false;
+                return;
+            }
+            if (event.getRepeatCount() != 0) return;
+            int keyCode = event.getKeyCode();
+            boolean down = event.getAction() == android.view.KeyEvent.ACTION_DOWN;
+            if (!down && event.getAction() != android.view.KeyEvent.ACTION_UP) return;
+            if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_CENTER
+                    || keyCode == android.view.KeyEvent.KEYCODE_ENTER) {
+                if (down && !touchpadPressed) togglePalette();
+                touchpadPressed = down;
+            } else if (keyCode == android.view.KeyEvent.KEYCODE_A
+                    || keyCode == android.view.KeyEvent.KEYCODE_BUTTON_A
+                    || keyCode == android.view.KeyEvent.KEYCODE_BUTTON_R2) {
+                if (down && !triggerPressed) pressedPaletteItem = hoveredPaletteItem;
+                if (!down && triggerPressed && paletteVisible
+                        && pressedPaletteItem != null && pressedPaletteItem == hoveredPaletteItem) {
+                    applyPaletteSelection((Integer) pressedPaletteItem.getTag());
+                }
+                triggerPressed = down;
+                if (!down) pressedPaletteItem = null;
+            } else if (keyCode == android.view.KeyEvent.KEYCODE_BACK && down && paletteVisible) {
+                togglePalette();
+            }
+        }
+
+        private void chooseController() {
+            GVRCursorController preferred = null;
+            for (GVRCursorController controller : controllers) {
+                if (!controller.isEnabled()) continue;
+                if (controller.getControllerType() == GVRControllerType.CONTROLLER
+                        || (preferred == null && controller.getControllerType() == GVRControllerType.GAZE)) {
+                    preferred = controller;
+                }
+                if (controller.getControllerType() == GVRControllerType.CONTROLLER) break;
+            }
+            if (preferred != null && preferred != activeController) attachControllerLaser(preferred);
+        }
+
+        private void resetInteraction() {
+            resetTouch();
+            buttonEvents.clear();
+            pressedPaletteItem = null;
+            touchpadPressed = false;
+            triggerPressed = false;
+            if (paletteVisible) togglePalette();
+            if (laserObject != null) laserObject.setEnable(false);
+            if (laserHitDot != null) laserHitDot.setEnable(false);
+        }
+
+        private void detachController() {
+            resetTouch();
+            if (activeController != null) activeController.resetSceneObject();
+            if (controllerPose != null && controllerPose.getParent() != null) {
+                controllerPose.getParent().removeChildObject(controllerPose);
+            }
+            if (laserObject != null) laserObject.setEnable(false);
+            if (laserHitDot != null) laserHitDot.setEnable(false);
+            if (hoveredPaletteItem != null) clearPaletteHover(hoveredPaletteItem);
+            buttonEvents.clear();
+            pressedPaletteItem = null;
+            touchpadPressed = false;
+            triggerPressed = false;
+            activeController = null;
+            controllerPose = null;
+            laserObject = null;
+        }
+
+        private void attachControllerLaser(GVRCursorController controller) {
+            detachController();
+            controllerPose = new GVRSceneObject(getGVRContext());
+            GVRLineSceneObject laser = new GVRLineSceneObject(getGVRContext(), 12f);
+            GVRMaterial laserMaterial = new GVRMaterial(getGVRContext());
+            laserMaterial.setColor(0.15f, 0.85f, 1.0f);
+            laserMaterial.setLineWidth(2f);
+            laser.getRenderData().setMaterial(laserMaterial);
+            laser.getRenderData().setDepthTest(true);
+            laser.getRenderData().setDepthMask(false);
+            laser.getRenderData().setRenderingOrder(10000);
+            laser.setPickingEnabled(false);
+            if (laserHitDot == null && getGVRContext() != null) {
+                createLaserHitDot(getGVRContext());
+            }
+            if (laserHitDot != null) {
+                if (laserHitDot.getParent() != null) {
+                    laserHitDot.getParent().removeChildObject(laserHitDot);
+                }
+                scene.addSceneObject(laserHitDot);
+            }
+            controllerPose.addChildObject(laser);
+            if (controller.getControllerType() == GVRControllerType.CONTROLLER) {
+                controller.setSceneObject(controllerPose);
+                controllerPose.getTransform().setPosition(0f, 0f, 0f);
+            } else {
+                scene.getMainCameraRig().addChildObject(controllerPose);
+            }
+            laserObject = laser;
+            activeController = controller;
+        }
+
+        private void createBackgroundPalette(GVRContext context) {
+            paletteRoot = new GVRSceneObject(context);
+            paletteRoot.setName("background-palette");
+            paletteRoot.setEnable(false);
+            scene.addSceneObject(paletteRoot);
+            paletteItems = new GVRSceneObject[BACKGROUND_PATHS.length + 1];
+            paletteMaterials = new GVRMaterial[paletteItems.length];
+            float itemWidth = 0.58f;
+            float itemHeight = 0.34f;
+            float ringRadius = 1.34f;
+            for (int index = 0; index < paletteItems.length; index++) {
+                double angle = -Math.PI / 2.0 + 2.0 * Math.PI * index / paletteItems.length;
+                GVRSceneObject tile = new GVRSceneObject(context, itemWidth, itemHeight);
+                tile.setName("background-option-" + index);
+                tile.setTag(index);
+                tile.attachCollider(new GVRMeshCollider(context, true));
+                GVRMaterial material = new GVRMaterial(context);
+                material.setColor(index == backgroundIndex ? 0xff168aad : 0xff263744);
+                tile.getRenderData().setMaterial(material);
+                tile.getRenderData().setRenderingOrder(0);
+                tile.getTransform().setPosition((float) Math.cos(angle) * ringRadius,
+                    (float) Math.sin(angle) * ringRadius, -2.15f);
+                if (index < BACKGROUND_PATHS.length) {
+                    loadBackgroundThumbnail(context, index, material);
+                } else {
+                    android.graphics.Bitmap bitmap = android.graphics.Bitmap.createBitmap(
+                            256, 144, android.graphics.Bitmap.Config.ARGB_8888);
+                    android.graphics.Canvas canvas = new android.graphics.Canvas(bitmap);
+                    canvas.drawColor(0xff183c35);
+                    android.graphics.Paint paint = new android.graphics.Paint(
+                            android.graphics.Paint.ANTI_ALIAS_FLAG);
+                    paint.setColor(0xffffffff);
+                    paint.setTextSize(36f);
+                    paint.setTextAlign(android.graphics.Paint.Align.CENTER);
+                    canvas.drawText("Camera", 128f, 85f, paint);
+                    org.gearvrf.GVRTexture texture = new org.gearvrf.GVRTexture(context);
+                    texture.setImage(new org.gearvrf.GVRBitmapTexture(context, bitmap));
+                    material.setMainTexture(texture);
+                }
+                paletteRoot.addChildObject(tile);
+                paletteItems[index] = tile;
+                paletteMaterials[index] = material;
+            }
+        }
+
+        private void createLaserHitDot(GVRContext context) {
+            laserHitDot = new GVRSphereSceneObject(context, false, 0.008f);
+            GVRMaterial material = new GVRMaterial(context);
+            material.setColor(0xff00e5ff);
+            laserHitDot.getRenderData().setMaterial(material);
+            laserHitDot.getRenderData().disableLight();
+            laserHitDot.getRenderData().setDepthTest(true);
+            laserHitDot.getRenderData().setDepthMask(false);
+            laserHitDot.getRenderData().setRenderingOrder(10001);
+            laserHitDot.setPickingEnabled(false);
+            laserHitDot.setEnable(false);
+            scene.addSceneObject(laserHitDot);
+        }
+
+        private void loadBackgroundThumbnail(GVRContext context, int index, GVRMaterial material) {
+            try {
+                String thumbnailPath = "backgrounds/thumbnails/"
+                        + BACKGROUND_PATHS[index].substring("backgrounds/".length());
+                GVRAndroidResource resource = new GVRAndroidResource(context, thumbnailPath);
+                org.gearvrf.GVRTexture texture = context.getAssetLoader().loadTexture(resource,
+                        new GVRAndroidResource.TextureCallback() {
+                            @Override
+                            public boolean stillWanted(GVRAndroidResource requestedResource) {
+                                return requestedResource.equals(resource);
+                            }
+
+                            @Override
+                            public void loaded(org.gearvrf.GVRImage image,
+                                               GVRAndroidResource loadedResource) {
+                            }
+
+                            @Override
+                            public void failed(Throwable error,
+                                               GVRAndroidResource failedResource) {
+                                Log.w("GearVRStream", "Background thumbnail unavailable: "
+                                        + BACKGROUND_NAMES[index], error);
+                            }
+                        });
+                material.setMainTexture(texture);
+            } catch (IOException error) {
+                Log.w("GearVRStream", "Background thumbnail unavailable: "
+                        + BACKGROUND_NAMES[index], error);
+            }
+        }
+
+        private void togglePalette() {
+            if (paletteRoot == null) return;
+            resetTouch();
+            pressedPaletteItem = null;
+            paletteVisible = !paletteVisible;
+            paletteRoot.setEnable(paletteVisible);
+            if (!paletteVisible) {
+                if (hoveredPaletteItem != null) clearPaletteHover(hoveredPaletteItem);
+                if (laserHitDot != null) laserHitDot.setEnable(false);
+            }
+        }
+
+        private void updatePaletteHover(GVRSceneObject item) {
+            if (hoveredPaletteItem != item && hoveredPaletteItem != null) {
+                int oldIndex = (Integer) hoveredPaletteItem.getTag();
+                paletteMaterials[oldIndex].setColor(oldIndex == backgroundIndex
+                        ? 0xff168aad : 0xff263744);
+            }
+            int index = (Integer) item.getTag();
+            if (hoveredPaletteItem != item) {
+                hoveredPaletteItem = item;
+                paletteMaterials[index].setColor(0xffe07a32);
+            }
+        }
+
+        private void clearPaletteHover(GVRSceneObject item) {
+            if (hoveredPaletteItem != item) return;
+            int index = (Integer) item.getTag();
+            paletteMaterials[index].setColor(index == backgroundIndex
+                    ? 0xff168aad : 0xff263744);
+            hoveredPaletteItem = null;
+            laserHitDot.setEnable(false);
+        }
+
+        private void applyPaletteSelection(int index) {
+            if (index == BACKGROUND_PATHS.length
+                    && checkSelfPermission(Manifest.permission.CAMERA)
+                    != PackageManager.PERMISSION_GRANTED) {
+                runOnUiThread(() -> requestPermissions(
+                        new String[] {Manifest.permission.CAMERA}, CAMERA_PERMISSION_REQUEST));
+                return;
+            }
+            resetTouch();
+            backgroundIndex = index;
+            cameraRequested = index == BACKGROUND_PATHS.length;
+            if (cameraRequested) {
+                if (cameraObject == null) {
+                    GVRVideoSceneObject preview = new GVRVideoSceneObject(getGVRContext(),
+                            16f, 9f, cameraPlayer, GVRVideoSceneObject.GVRVideoType.MONO);
+                    preview.setName("rear-camera-passthrough");
+                    preview.getTransform().setPosition(0f, 0f, -4f);
+                    preview.getRenderData().setDepthTest(false);
+                    preview.getRenderData().setDepthMask(false);
+                    preview.getRenderData().setRenderingOrder(-90);
+                    preview.setPickingEnabled(false);
+                    scene.getMainCameraRig().addChildObject(preview);
+                    cameraObject = preview;
+                }
+                cameraObject.setEnable(true);
+                cameraPlayer.start();
+            } else {
+                if (cameraObject != null) cameraObject.setEnable(false);
+                cameraPlayer.pause();
+                loadBackground(getGVRContext(), index);
+            }
+            updateScreenOpacity();
+            for (int itemIndex = 0; itemIndex < paletteMaterials.length; itemIndex++) {
+                paletteMaterials[itemIndex].setColor(itemIndex == index
+                        ? 0xff168aad : 0xff263744);
+                paletteItems[itemIndex].getTransform().setScale(1f, 1f, 1f);
+            }
+            paletteVisible = false;
+            paletteRoot.setEnable(false);
+            hoveredPaletteItem = null;
+            laserHitDot.setEnable(false);
         }
 
         private void changeBackground(int direction) {
@@ -704,7 +1116,6 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
             try {
                 resource = new GVRAndroidResource(context, BACKGROUND_PATHS[index]);
             } catch (IOException error) {
-                renderStatus("Background unavailable: " + BACKGROUND_NAMES[index]);
                 return;
             }
             org.gearvrf.GVRTexture texture = context.getAssetLoader().loadTexture(resource,
@@ -717,12 +1128,10 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
                         @Override
                         public void loaded(org.gearvrf.GVRImage image,
                                            GVRAndroidResource loadedResource) {
-                            renderStatus("Background: " + BACKGROUND_NAMES[index]);
                         }
 
                         @Override
                         public void failed(Throwable error, GVRAndroidResource failedResource) {
-                            renderStatus("Background load failed: " + BACKGROUND_NAMES[index]);
                         }
                     }, parameters, 1, 1);
             if (backgroundObject == null) {
@@ -731,11 +1140,108 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
                 backgroundObject.getRenderData().setDepthTest(false);
                 backgroundObject.getRenderData().setDepthMask(false);
                 backgroundObject.getRenderData().setRenderingOrder(-100);
+                backgroundObject.getRenderData().getPass(0)
+                    .setCullFace(org.gearvrf.GVRRenderPass.GVRCullFaceEnum.None);
                 scene.addSceneObject(backgroundObject);
             } else {
                 backgroundObject.getRenderData().getMaterial().setMainTexture(texture);
             }
         }
+    }
+
+    private final class CameraSurfacePlayer implements GVRVideoSceneObjectPlayer<Camera> {
+        private Camera camera;
+        private volatile Surface surface;
+
+        @Override
+        public Camera getPlayer() { return camera; }
+
+        @Override
+        public void setSurface(Surface surface) {
+            this.surface = surface;
+            start();
+        }
+
+        @Override
+        public void start() {
+            mainHandler.post(() -> {
+                if (!activityResumed || !cameraRequested || surface == null || camera != null
+                        || checkSelfPermission(Manifest.permission.CAMERA)
+                        != PackageManager.PERMISSION_GRANTED) return;
+                try {
+                    int cameraId = -1;
+                    Camera.CameraInfo info = new Camera.CameraInfo();
+                    for (int index = 0; index < Camera.getNumberOfCameras(); index++) {
+                        Camera.getCameraInfo(index, info);
+                        if (info.facing == Camera.CameraInfo.CAMERA_FACING_BACK) {
+                            cameraId = index;
+                            break;
+                        }
+                    }
+                    if (cameraId < 0) throw new IllegalStateException("No rear camera available");
+                    camera = Camera.open(cameraId);
+                    Camera.Parameters parameters = camera.getParameters();
+                    Camera.Size bestSize = null;
+                    for (Camera.Size size : parameters.getSupportedPreviewSizes()) {
+                        if (size.width <= 1280 && Math.abs((float) size.width / size.height
+                                - 16f / 9f) < 0.03f
+                                && (bestSize == null || size.width > bestSize.width)) bestSize = size;
+                    }
+                    if (bestSize != null) parameters.setPreviewSize(bestSize.width, bestSize.height);
+                    if (parameters.getSupportedFocusModes().contains(
+                            Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO)) {
+                        parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO);
+                    }
+                    camera.setParameters(parameters);
+                    int rotation = getWindowManager().getDefaultDisplay().getRotation() * 90;
+                    camera.setDisplayOrientation((info.orientation - rotation + 360) % 360);
+                    camera.setPreviewDisplay(new android.view.SurfaceHolder() {
+                        @Override public Surface getSurface() { return surface; }
+                        @Override public void addCallback(Callback callback) { }
+                        @Override public void removeCallback(Callback callback) { }
+                        @Override public boolean isCreating() { return false; }
+                        @Override public void setType(int type) { }
+                        @Override public void setFixedSize(int width, int height) { }
+                        @Override public void setSizeFromLayout() { }
+                        @Override public void setFormat(int format) { }
+                        @Override public void setKeepScreenOn(boolean keepScreenOn) { }
+                        @Override public android.graphics.Canvas lockCanvas() { return null; }
+                        @Override public android.graphics.Canvas lockCanvas(android.graphics.Rect dirty) { return null; }
+                        @Override public void unlockCanvasAndPost(android.graphics.Canvas canvas) { }
+                        @Override public android.graphics.Rect getSurfaceFrame() { return new android.graphics.Rect(); }
+                    });
+                    camera.startPreview();
+                    Log.i("GearVRStream", "Rear camera passthrough started");
+                } catch (IOException | RuntimeException error) {
+                    closeCamera();
+                    Log.e("GearVRStream", "Rear camera unavailable", error);
+                    Toast.makeText(MainActivity.this, "Rear camera unavailable",
+                            Toast.LENGTH_LONG).show();
+                }
+            });
+        }
+
+        private void closeCamera() {
+            if (camera == null) return;
+            try { camera.stopPreview(); } catch (RuntimeException ignored) { }
+            camera.release();
+            camera = null;
+        }
+
+        @Override
+        public void pause() { mainHandler.post(this::closeCamera); }
+
+        @Override
+        public void release() {
+            mainHandler.post(() -> {
+                closeCamera();
+                if (surface != null) surface.release();
+                surface = null;
+            });
+        }
+
+        @Override
+        public boolean canReleaseSurfaceImmediately() { return false; }
     }
 
     private final class DecoderSurfacePlayer implements GVRVideoSceneObjectPlayer<MediaCodec> {
@@ -746,9 +1252,11 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
 
         @Override
         public void setSurface(Surface surface) {
-            decoderSurface = surface;
-            if (videoSps != null && videoPps != null) {
-                configureDecoder(videoWidth, videoHeight, videoSps, videoPps);
+            synchronized (MainActivity.this) {
+                decoderSurface = surface;
+                if (videoSps != null && videoPps != null) {
+                    configureDecoder(videoWidth, videoHeight, videoSps, videoPps);
+                }
             }
         }
 
@@ -756,12 +1264,14 @@ public final class MainActivity extends GVRActivity implements SensorEventListen
         public void release() {
             synchronized (MainActivity.this) {
                 releaseDecoder();
+                if (decoderSurface != null) decoderSurface.release();
+                decoderSurface = null;
             }
         }
 
         @Override
         public boolean canReleaseSurfaceImmediately() {
-            return true;
+            return false;
         }
 
         @Override
