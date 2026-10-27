@@ -43,6 +43,19 @@ private struct SenderView: View {
             .pickerStyle(.menu)
             .disabled(sender.isStreaming)
 
+            Toggle("Share two displays side by side", isOn: $sender.shareBothDisplays)
+                .disabled(sender.isStreaming || sender.displays.count < 2)
+
+            if sender.shareBothDisplays {
+                Picker("Right display", selection: $sender.secondDisplayID) {
+                    ForEach(sender.displays.filter { $0.displayID != sender.selectedDisplayID }) { display in
+                        Text(display.name).tag(display.displayID)
+                    }
+                }
+                .pickerStyle(.menu)
+                .disabled(sender.isStreaming)
+            }
+
             HStack {
                 Label("1080p", systemImage: "rectangle.inset.filled")
                 Spacer()
@@ -64,6 +77,20 @@ private struct SenderView: View {
                     .foregroundStyle(.secondary)
             }
             .padding(.top, 4)
+
+            Toggle("Remote mouse", isOn: $sender.remoteMouseEnabled)
+            Text(sender.inputStatus)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Toggle("Simulator motion feed", isOn: $sender.motionForwardingEnabled)
+            HStack {
+                Text(sender.motionStatus)
+                Spacer()
+                Text("UDP 127.0.0.1:43130")
+                    .monospaced()
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
 
             Text(sender.isStreaming
                  ? "Encoded frames: \(sender.encodedFrameCount)  |  Data: \(sender.encodedByteCount / 1_000_000) MB"
@@ -94,6 +121,11 @@ private struct SenderView: View {
             }
         }
         .padding(24)
+        .onChange(of: sender.selectedDisplayID) { displayID in
+            if sender.secondDisplayID == displayID {
+                sender.secondDisplayID = sender.displays.first(where: { $0.displayID != displayID })?.displayID ?? 0
+            }
+        }
         .task {
             await sender.refreshDisplays()
             sender.startServer()

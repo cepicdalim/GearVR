@@ -5,3 +5,12 @@ macOS/build/
 macOS/DerivedData/
 macOS/GearVRStreamSender.xcodeproj/
 .DS_Store
+local.properties
+**/build/
+*.apk
+*.keystore
+*.jks
+libs/
+Gear VR Install APKs/
+*.xcuserstate
+xcuserdata/
